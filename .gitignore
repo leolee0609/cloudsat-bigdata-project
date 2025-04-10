@@ -1,0 +1,13 @@
+# Ignore temporary/large data directories
+row_data/
+raw_data/
+chunks/
+adjacency/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS system files
+.DS_Store
