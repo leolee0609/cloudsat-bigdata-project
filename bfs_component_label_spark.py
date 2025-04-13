@@ -1,162 +1,149 @@
-#!/usr/bin/env python
-"""
-bfs_component_label_spark.py
-----------------------------
-Use PySpark to run a BFS-based connected-component labeling 
-on an adjacency list of event pixels.
-
-Usage:
-  spark-submit bfs_component_label_spark.py \
-    --adjacency_dir /path/to/adjacency_dir \
-    --output_dir /path/to/bfs_output \
-    [--reducers 4]
-
-Example adjacency format (JSON lines):
-  {
-    "key": ["file_1", 10, 2],
-    "value": [["file_1", 9, 2], ["file_1", 11, 2]]
-  }
-  which means pixel ("file_1",10,2) has neighbors [("file_1",9,2), ("file_1",11,2)].
-"""
+#!/usr/bin/env python3
 
 import os
 import sys
+import shutil
 import argparse
-import json
+import ast
 from pyspark.sql import SparkSession
 
-MAX_ITERATIONS = 100
-
-def map_phase_func(record):
+def expandOneStep(record):
     """
-    BFS Map step:
-    Input 'record': (pixel, (clusterSet, neighbors))
-      - pixel: a tuple like ("file_1", 10, 2)
-      - clusterSet: a Python set, e.g. {("file_1", 10, 2), ...}
-      - neighbors: a list of neighbor pixels
-
-    We emit:
-      (pixel -> clusterSet)   # keep the current cluster info for this pixel
-      (nbr   -> clusterSet)   # for each neighbor, propagate this clusterSet
+    Given (p, neighborsSet),
+    emit (p, neighborsSet) so p retains its old info,
+    AND for each neighbor q in neighborsSet, emit (q, neighborsSet)
+    so q learns about p's connectivity.
     """
-    pixel, (cluster_set, neighbors) = record
-    out = []
-    # Keep pixel => cluster_set
-    out.append((pixel, cluster_set))
+    p, neighbors = record
+    # Emit the original pair
+    yield (p, neighbors)
+    # Emit for each neighbor
+    for q in neighbors:
+        yield (q, neighbors)
 
-    # For each neighbor, pass the same cluster_set
-    for n in neighbors:
-        out.append((n, cluster_set))
+def unionSets(set1, set2):
+    """Return the union of two Python sets."""
+    return set1.union(set2)
 
-    return out
-
-def reduce_phase_func(a, b):
+def parseAdjacencyLine(line):
     """
-    BFS Reduce step: union the cluster sets for this pixel.
-    a, b are both Python sets of pixels.
+    Parse a line of the form:
+       "((file_no, t, x, y, h), [(file_no, t2, x2, y2, h2), ...])"
+    into:
+       ((file_no, t, x, y, h), set_of_neighbors)
+
+    Where each neighbor is also (file_no, tNeighbor, xNeighbor, yNeighbor, hNeighbor).
     """
-    return a.union(b)
+    kv = ast.literal_eval(line.strip())      
+    # e.g. kv => ((file_no, t, x, y, h), [(file_no, t2, x2, y2, h2), (file_no, t3, x3, y3, h3), ...])
+    key, neighbor_list = kv
+    neighbor_set = set(neighbor_list)       
+    return (key, neighbor_set)
 
-def compute_delta(old_rdd, new_rdd):
+def main(adjacency_input, output_path):
     """
-    Compare old_rdd vs new_rdd to see how many new members were added.
-    Both are (pixel, set_of_pixels). We leftOuterJoin to see differences.
+    Parallel BFS for connected components, where the adjacency lines are keyed by
+    (file_no, t, x, y, h).
+
+    1) Reads adjacency lines of the form:
+         "((file_no, t, x, y, h), [(file_no, t2, x2, y2, h2), ...])"
+    2) Iteratively merges adjacency sets until no new neighbors appear (BFS).
+    3) Assigns each connected component a unique event_id.
+    4) Outputs lines: "(((file_no, t, x, y, h), event_id))"
     """
-    joined = old_rdd.leftOuterJoin(new_rdd)
-    def count_added(row):
-        pixel, (oldset, newset) = row
-        oldset = oldset if oldset else set()
-        added = newset.difference(oldset)
-        return len(added)
-    return joined.map(count_added).sum()
+    spark = SparkSession.builder.appName("ParallelBFSConnectedComponents_XYTH").getOrCreate()
 
-def assign_labels(final_rdd):
-    """
-    After BFS converges, final_rdd => (pixel, set_of_pixels).
-    1) Convert each set_of_pixels into a sorted tuple => identify distinct connected components.
-    2) zipWithUniqueId => assign each distinct set an integer label.
-    3) Map each pixel's set -> label.
-    """
-    # Distinct sets
-    cluster_sets = final_rdd.map(lambda x: tuple(sorted(x[1]))).distinct()
+    # Hide Spark's own INFO logs, show only errors
+    spark.sparkContext.setLogLevel("ERROR")
 
-    # Assign a unique ID to each set; shift ID to start at 1
-    set_with_id = cluster_sets.zipWithUniqueId().map(lambda x: (x[0], x[1] + 1))
+    # Remove output directory if it exists
+    if os.path.exists(output_path):
+        print(f"[INFO] Removing existing directory: {output_path}")
+        shutil.rmtree(output_path)
 
-    # Collect mapping into driver memory. For extremely large data, you may need a different approach.
-    set_map = set_with_id.collectAsMap()
-    bc_map = final_rdd.context.broadcast(set_map)
+    # 1) Read adjacency from textFile
+    adjacency_rdd = spark.sparkContext.textFile(adjacency_input).map(parseAdjacencyLine)
+    # => RDD[((file_no, t, x, y, h), set_of_neighbors)]
 
-    # Map each pixel->(the ID of its cluster set)
-    labeled_rdd = final_rdd.mapValues(lambda s: bc_map.value[tuple(sorted(s))])
-    return labeled_rdd
+    # 2) Initialize BFS state = immediate adjacency
+    bfs_state_rdd = adjacency_rdd
+    iteration = 0
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--adjacency_dir", required=True, 
-                        help="Directory of adjacency JSON lines or parquet")
-    parser.add_argument("--output_dir", required=True, 
-                        help="Output directory for BFS iteration + final labels")
-    parser.add_argument("--reducers", type=int, default=4, 
-                        help="Number of shuffle partitions (reducers)")
-    args = parser.parse_args()
+    # 3) Iteratively expand adjacency until no new neighbors
+    while True:
+        iteration += 1
+        # Expand adjacency
+        expanded = bfs_state_rdd.flatMap(expandOneStep)
+        # => for each (p, set_of_neighbors) => (p, set_of_neighbors) + (neighbor, set_of_neighbors)
 
-    spark = SparkSession.builder.appName("SparkBFSComponentLabel").getOrCreate()
-    sc = spark.sparkContext
-    sc.setLogLevel("WARN")
+        # Merge adjacency
+        new_bfs_state_rdd = expanded.reduceByKey(unionSets)
 
-    spark.conf.set("spark.sql.shuffle.partitions", str(args.reducers))
+        # Check BFS delta (# of newly discovered neighbors this iteration)
+        joined = bfs_state_rdd.join(new_bfs_state_rdd)  
+        # => (p, (oldSet, newSet))
 
-    # 1) Load adjacency from JSON lines
-    # Each record => { "key": [file_id, t, h], "value": [[file_id, tn, hn], ...] }
-    # We'll parse them into (pixel -> [neighbors]) pairs.
-    adjacency_rdd = sc.textFile(args.adjacency_dir) \
-                      .map(json.loads) \
-                      .map(lambda d: (tuple(d["key"]), [tuple(n) for n in d["value"]]))
+        bfs_delta = joined.mapValues(lambda pair: len(pair[1] - pair[0])) \
+                          .values() \
+                          .sum()
 
-    if adjacency_rdd.isEmpty():
-        print("No adjacency data found. Exiting.")
-        spark.stop()
-        return
+        print(f"Iteration {iteration}, BFS delta = {bfs_delta}")
 
-    # 2) Initialize BFS => (pixel -> {pixel})
-    # That is, each pixel starts in its own cluster set
-    pixel_to_set_rdd = adjacency_rdd.map(lambda x: (x[0], {x[0]}))
-
-    # 3) BFS iteration
-    for i in range(MAX_ITERATIONS):
-        # Join cluster sets with adjacency => (pixel, (clusterSet, neighbors))
-        joined_rdd = pixel_to_set_rdd.join(adjacency_rdd, numPartitions=args.reducers)
-        
-        # Map: propagate cluster sets to neighbors
-        mapped = joined_rdd.flatMap(map_phase_func)
-        
-        # Reduce: union sets for each pixel
-        new_pixel_to_set_rdd = mapped.reduceByKey(reduce_phase_func, numPartitions=args.reducers)
-        
-        # Check convergence (how many new elements got added)
-        changes = compute_delta(pixel_to_set_rdd, new_pixel_to_set_rdd)
-        print(f"Iteration {i}, BFS delta = {int(changes)}")
-
-        pixel_to_set_rdd = new_pixel_to_set_rdd
-
-        if changes == 0:
-            print(f"BFS converged at iteration {i}")
+        if bfs_delta == 0:
+            # Converged
             break
+        else:
+            bfs_state_rdd = new_bfs_state_rdd
 
-    # 4) Assign final numeric labels per connected component
-    labeled_rdd = assign_labels(pixel_to_set_rdd)
+    # 4) Assign each connected component a unique event_id
+    # Ensure each pixel p is in its adjacency set
+    final_bfs_rdd = bfs_state_rdd.map(lambda kv: (kv[0], kv[1].union({kv[0]})))
+    # => (p, neighborsSet ∪ {p})
 
-    # 5) Save final pixel->label mapping as partitioned JSON lines
-    def to_json_line(x):
-        (pixel, label) = x
-        return json.dumps({"key": list(pixel), "value": label})
+    # Representative = min(all connected pixels in that set)
+    pixel_representative_rdd = final_bfs_rdd.mapValues(lambda s: min(s))
+    # => (p, representative)
 
-    labeled_rdd.map(to_json_line).saveAsTextFile(
-        os.path.join(args.output_dir, "final_labels")
-    )
+    # Distinct reps => (rep, event_id) pairs
+    distinct_reps = pixel_representative_rdd.values().distinct()
+    reps_with_id = distinct_reps.zipWithIndex()
+    # => (representative, event_id)
+
+    # Now join each p with its representative's event_id
+    # pixel_representative_rdd => (p, rep)
+    # reps_with_id => (rep, event_id)
+    joined_rdd = pixel_representative_rdd.map(lambda kv: (kv[1], kv[0])) \
+                                         .join(reps_with_id)
+    # => (rep, (p, event_id))
+
+    # final: (p, event_id)
+    final_labeled_rdd = joined_rdd.map(lambda kv: (kv[1][0], kv[1][1]))
+
+    # 5) Save final results as text
+    final_labeled_rdd.saveAsTextFile(output_path)
+    print(f"[INFO] Wrote BFS-labeled connected components to {output_path}")
 
     spark.stop()
 
 if __name__ == "__main__":
-    main()
+    """
+    Usage:
+      spark-submit bfs_component_label_xyth.py \
+          /path/to/adjacency_out_xyth \
+          /path/to/bfs_labeled_out
+
+    Where adjacency_out_xyth has lines like:
+      "((chunk_5000_10000.h5, 769287740.0, 45.1234, -120.5678, 30), 
+        [(chunk_5000_10000.h5, 769287740.0, 45.1234, -120.5678, 31), ...])"
+
+    This BFS script merges adjacency sets until converged, 
+    and then assigns each connected component an event_id.
+    """
+    parser = argparse.ArgumentParser(
+        description="Parallel BFS for XYTH keys: (file_no, t, x, y, h)."
+    )
+    parser.add_argument("adjacency_input", help="Path to adjacency text files keyed by (file_no, t, x, y, h).")
+    parser.add_argument("output_path", help="Directory to write BFS-labeled connected components.")
+    args, extra = parser.parse_known_args()
+
+    main(args.adjacency_input, args.output_path)

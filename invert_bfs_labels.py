@@ -1,83 +1,90 @@
-#!/usr/bin/env python
-"""
-invert_bfs_labels.py
---------------------
-Build an inverted index from (pixel -> label) to (label -> [pixels])
-using PySpark. Typically used after BFS/connected-component labeling.
-
-Usage:
-  spark-submit invert_bfs_labels.py \
-    --bfs_output_dir /path/to/bfs_labeled_json \
-    --inverted_index_dir /path/to/inverted_index_output
-
-Example BFS Output JSON line:
-  {"key": ["file_1", 10, 2], "value": 12}
-
-This script will produce lines like:
-  {"label": 12, "pixels": [["file_1", 10, 2], ["file_1", 9, 2], ...]}
-"""
+#!/usr/bin/env python3
 
 import os
 import sys
-import argparse
-import json
 import shutil
+import argparse
+import ast
 from pyspark.sql import SparkSession
 
-def main():
-    parser = argparse.ArgumentParser(description="Invert BFS-labeled data to get event -> pixels mapping.")
-    parser.add_argument("--bfs_output_dir", required=True,
-                        help="Directory containing BFS-labeled JSON lines (pixel -> label).")
-    parser.add_argument("--inverted_index_dir", required=True,
-                        help="Output directory for the inverted index (label -> list_of_pixels).")
-    args = parser.parse_args()
+def parsePixelEventLine(line):
+    """
+    Each line from the BFS-labeled output looks like:
+      "((file_no, t, x, y, h), event_id)"
 
-    # 1) Remove existing output directory if it exists
-    if os.path.exists(args.inverted_index_dir):
-        print(f"Removing existing directory: {args.inverted_index_dir}")
-        shutil.rmtree(args.inverted_index_dir, ignore_errors=True)
+    We'll parse that into:
+      ((file_no, t, x, y, h), event_id)
+    """
+    return ast.literal_eval(line.strip())
 
-    # 2) Create Spark session
-    spark = SparkSession.builder.appName("InvertBFSLabels").getOrCreate()
-    sc = spark.sparkContext
-    sc.setLogLevel("WARN")
+def unionSets(set1, set2):
+    """Return the union of two Python sets."""
+    return set1.union(set2)
 
-    # 3) Read BFS-labeled data from JSON lines
-    #    Format: {"key": ["file_1", 10, 2], "value": 12}
-    #    => ( pixel_tuple, label_int )
-    labeled_rdd = sc.textFile(args.bfs_output_dir) \
-                    .map(json.loads) \
-                    .map(lambda record: (tuple(record["key"]), record["value"]))
+def main(pixel2event_path, output_path):
+    spark = SparkSession.builder.appName("InvertedIndexEvents_XYTH").getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")  # only show errors
 
-    if labeled_rdd.isEmpty():
-        print("No BFS-labeled data found. Exiting.")
-        spark.stop()
-        return
+    # Remove output directory if it exists (LOCAL FS)
+    if os.path.exists(output_path):
+        print(f"[INFO] Removing existing directory: {output_path}")
+        shutil.rmtree(output_path)
 
-    # 4) Invert each record => (label, pixel)
-    label_pixel_rdd = labeled_rdd.map(lambda x: (x[1], x[0]))
+    #----------------------------------------------------------------------------
+    # 1) Read BFS-labeled data from pixel2event_path
+    #    Each line: "((file_no, t, x, y, h), event_id)"
+    #----------------------------------------------------------------------------
+    labeled_rdd = spark.sparkContext.textFile(pixel2event_path).map(parsePixelEventLine)
+    # => RDD[ ((file_no, t, x, y, h), event_id) ]
 
-    # 5) Group all pixels by label => (label -> [pixel1, pixel2, ...])
-    #    This is the 'reduceByKey' or 'groupByKey' step in a MapReduce sense.
-    event_to_pixels_rdd = label_pixel_rdd.groupByKey().mapValues(list)
+    #----------------------------------------------------------------------------
+    # 2) Invert the mapping -> (event_id, (file_no, t, x, y, h))
+    #----------------------------------------------------------------------------
+    inverted_rdd = labeled_rdd.map(lambda kv: (kv[1], kv[0]))
+    # => RDD[ (event_id, (file_no, t, x, y, h)) ]
 
-    # 6) Convert each (label, [pixels]) to JSON lines
-    def to_json_line(item):
-        label, pix_list = item
-        # pix_list is a list of tuples => convert each to a list for JSON
-        pix_list_json = [list(pix) for pix in pix_list]
-        return json.dumps({
-            "label": label,
-            "pixels": pix_list_json
-        })
+    #----------------------------------------------------------------------------
+    # 3) Group or reduce to collect all pixels for each event_id.
+    #    We'll use reduceByKey with set-union to avoid duplicates
+    #----------------------------------------------------------------------------
+    inverted_as_sets = inverted_rdd.mapValues(lambda px: {px})
+    # => RDD[ (event_id, set( (file_no, t, x, y, h) )) ]
 
-    inverted_rdd = event_to_pixels_rdd.map(to_json_line)
+    grouped = inverted_as_sets.reduceByKey(unionSets)
+    # => RDD[ (event_id, setOfAllPixels) ]
 
-    # 7) Save to partitioned JSON lines
-    inverted_rdd.saveAsTextFile(args.inverted_index_dir)
+    #----------------------------------------------------------------------------
+    # 4) Convert final sets to lists for easy serialization
+    #----------------------------------------------------------------------------
+    event_to_pixels_rdd = grouped.map(lambda kv: (kv[0], list(kv[1])))
+    # => RDD[ (event_id, [(file_no, t, x, y, h), ...]) ]
 
-    print(f"Inverted index saved to {args.inverted_index_dir}")
+    #----------------------------------------------------------------------------
+    # 5) Write final inverted index as text
+    #    Each line: "(event_id, [(file_no, t, x, y, h), (file_no, t2, x2, y2, h2), ...])"
+    #----------------------------------------------------------------------------
+    event_to_pixels_rdd.saveAsTextFile(output_path)
+    print(f"[INFO] Wrote inverted index to {output_path}")
+
     spark.stop()
 
 if __name__ == "__main__":
-    main()
+    """
+    Example usage:
+      spark-submit spark_inverted_index_xyth.py \
+        ./pixel2event_xyth \
+        ./event_to_pixels_out_xyth
+
+    This script expects BFS-labeled lines like:
+        "((file_no, t, x, y, h), event_id)"
+    and writes lines like:
+        "(event_id, [(file_no, t, x, y, h), ...])"
+    """
+    parser = argparse.ArgumentParser(
+        description="Build an inverted index from BFS-labeled pixel->event mappings (XYTH keys)."
+    )
+    parser.add_argument("pixel2event_path", help="Path to BFS-labeled directory with lines ((file_no, t, x, y, h), event_id).")
+    parser.add_argument("output_path", help="Directory to write the event->pixels inverted index.")
+    args, extra = parser.parse_known_args()
+
+    main(args.pixel2event_path, args.output_path)

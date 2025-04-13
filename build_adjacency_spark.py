@@ -1,133 +1,173 @@
-#!/usr/bin/env python
-"""
-build_adjacency_spark.py
-------------------------
-Reads chunked data (Parquet or .h5) in Spark, builds adjacency for 
-(event) pixels in a distributed manner, and writes adjacency as 
-partitioned JSON lines.
-
-This script removes any existing files in the output directory
-before it saves new output.
-
-Usage:
-  spark-submit build_adjacency_spark.py \
-    --input_dir /path/to/parquet_dir \
-    --output_dir /path/to/adjacency_dir \
-    [--file_id mydata]
-
-Example Steps:
-1. spark-submit chunk_h5_spark.py ...  # produce a Parquet of (index, height, channels)
-2. spark-submit build_adjacency_spark.py --input_dir parquet_dir --output_dir adjacency_dir
-"""
+#!/usr/bin/env python3
 
 import os
 import sys
-import argparse
-import json
+import h5py
 import shutil
+from pyspark.sql import SparkSession
 
-from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import *
+def isEvent(pixel):
+    """
+    Return True if the first channel of the pixel is > 4.0.
+    pixel is assumed to be a 1D array/list of channel values.
+    """
+    return pixel[0] > 4.0
 
-EVENT_CHANNEL_INDEX = 0  # which channel to check for > 0
+def build_event_adjacency(file_path):
+    """
+    Opens an HDF5 chunk file and, for each pixel that is an event, gathers
+    up/down/left/right neighbors if they are also event pixels.
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", required=True, help="Parquet or chunked dir")
-    parser.add_argument("--output_dir", required=True, help="Output adjacency dir (JSON)")
-    parser.add_argument("--file_id", default="some_id", help="ID prefix or partition identifier for each pixel")
-    args = parser.parse_args()
+    Specifically:
+      - Up/Down neighbors: same footprint (i), same lat/lon/t, adjacent bin h+1 or h-1
+      - Left/Right neighbors: adjacent footprint (i-1 or i+1), same bin h,
+        BUT only if |t_neighbor - t_current| <= 500 (seconds).
 
-    # ---------------------------------------------------
-    # 1) Remove existing output directory if it exists
-    # ---------------------------------------------------
-    if os.path.exists(args.output_dir):
-        print(f"Removing existing output directory: {args.output_dir}")
-        shutil.rmtree(args.output_dir, ignore_errors=True)
+    We also incorporate the footprint's Latitude (x) and Longitude (y).
+    So the key is:   (base_name, t, lat, lon, h)
+    And the adjacency list is a list of the same structure:
+        [(base_name, tNeighbor, latNeighbor, lonNeighbor, hNeighbor), ...]
 
-    # ---------------------------------------------------
-    # 2) Create Spark session & read input
-    # ---------------------------------------------------
-    spark = SparkSession.builder.appName("BuildAdjacency").getOrCreate()
-    spark.conf.set("spark.sql.shuffle.partitions", "200")  # or any suitable number
+    We'll only include neighbors that also pass isEvent(...) and meet the time constraint.
+    """
+    import h5py  # ensure it's available on the worker nodes
+    base_name = os.path.basename(file_path)
+    results = []
 
-    # For demonstration, assume the input is Parquet with columns: index, height, channels
-    df = spark.read.parquet(args.input_dir)
+    with h5py.File(file_path, 'r') as f:
+        input_features = f['input_features']          # shape: (N, height, channels)
+        footprint_attrs = f['footprint_attributes']   # shape: (N, num_attrs)
 
-    # ---------------------------------------------------
-    # 3) Filter event pixels: channels[0] > 4.0 
-    #    (adjust threshold or channel index as needed)
-    # ---------------------------------------------------
-    df_events = df.filter(F.col("channels")[EVENT_CHANNEL_INDEX] > 4.0)
+        num_footprints = input_features.shape[0]      # N footprints
+        height_dim = input_features.shape[1]          # vertical bins
 
-    # Add a "pixel_id" struct containing (file_id, t, h)
-    df_events = df_events.withColumn(
-        "pixel_id",
-        F.struct(
-            F.lit(args.file_id).alias("file_id"),
-            F.col("index").alias("t"),
-            F.col("height").alias("h")
-        )
-    )
+        # footprint_attrs columns, as typically laid out:
+        #   0 = Latitude
+        #   1 = Longitude
+        #   2 = TAI_start
+        #   3 = Profile_time
+        idx_lat = 0
+        idx_lon = 1
+        idx_tai_start = 2
+        idx_profile_time = 3
 
-    # ---------------------------------------------------
-    # 4) Convert to an RDD of pixel_id => e.g. 
-    #    Row(file_id=..., t=..., h=...)
-    # ---------------------------------------------------
-    rdd_events = df_events.select("pixel_id").rdd.map(lambda r: r["pixel_id"])
+        # Load entire arrays into memory for convenience
+        input_features_np = input_features[()]        
+        footprint_attrs_np = footprint_attrs[()]
 
-    # ---------------------------------------------------
-    # 5) Build adjacency in each partition
-    #    (We store pixel -> True in a dictionary, then 
-    #     for each pixel, look up neighbors.)
-    # ---------------------------------------------------
-    def map_pixels(iterator):
-        import collections
-        pixmap = collections.defaultdict(lambda: False)
-        pixels = list(iterator)
+        for i in range(num_footprints):
+            lat = footprint_attrs_np[i, idx_lat]
+            lon = footprint_attrs_np[i, idx_lon]
+            tai_start = footprint_attrs_np[i, idx_tai_start]
+            prof_time = footprint_attrs_np[i, idx_profile_time]
+            t_current = float(tai_start + prof_time)
 
-        # Mark each pixel in a local dict
-        for p in pixels:
-            pixmap[(p["file_id"], p["t"], p["h"])] = True
+            for h in range(height_dim):
+                pixel = input_features_np[i, h, :]
+                if isEvent(pixel):
+                    # Our key: (chunk_file, t_current, lat, lon, h)
+                    key = (base_name, t_current, float(lat), float(lon), h)
 
-        # Generate adjacency
-        results = []
-        for p in pixels:
-            file_id, t, h = p["file_id"], p["t"], p["h"]
-            neighbors = []
-            # up
-            if pixmap.get((file_id, t - 1, h), False):
-                neighbors.append([file_id, t - 1, h])
-            # down
-            if pixmap.get((file_id, t + 1, h), False):
-                neighbors.append([file_id, t + 1, h])
-            # left
-            if pixmap.get((file_id, t, h - 1), False):
-                neighbors.append([file_id, t, h - 1])
-            # right
-            if pixmap.get((file_id, t, h + 1), False):
-                neighbors.append([file_id, t, h + 1])
+                    # Build adjacency for neighbors
+                    neighbors = []
 
-            # key:   (file_id, t, h)
-            # value: list of neighbors
-            results.append(((file_id, t, h), neighbors))
+                    # Up neighbor => same footprint i, bin h+1
+                    if h + 1 < height_dim:
+                        nb_pixel = input_features_np[i, h + 1, :]
+                        if isEvent(nb_pixel):
+                            # same lat/lon/t
+                            neighbors.append((base_name, t_current, float(lat), float(lon), h + 1))
 
-        return iter(results)
+                    # Down neighbor => same footprint i, bin h-1
+                    if h - 1 >= 0:
+                        nb_pixel = input_features_np[i, h - 1, :]
+                        if isEvent(nb_pixel):
+                            neighbors.append((base_name, t_current, float(lat), float(lon), h - 1))
 
-    adjacency_rdd = rdd_events.mapPartitions(map_pixels)
-    # adjacency_rdd => ( (file_id, t, h), [[file_id, t_n, h_n], ... ] )
+                    # Left neighbor => footprint i-1, same h
+                    if i - 1 >= 0:
+                        lat_left = footprint_attrs_np[i - 1, idx_lat]
+                        lon_left = footprint_attrs_np[i - 1, idx_lon]
+                        tai_left = footprint_attrs_np[i - 1, idx_tai_start]
+                        prof_left = footprint_attrs_np[i - 1, idx_profile_time]
+                        t_left = float(tai_left + prof_left)
+                        nb_pixel = input_features_np[i - 1, h, :]
+                        # check time constraint + isEvent
+                        if isEvent(nb_pixel) and abs(t_left - t_current) <= 500.0:
+                            neighbors.append((base_name, t_left, float(lat_left), float(lon_left), h))
 
-    # ---------------------------------------------------
-    # 6) Convert adjacency to JSON lines & save
-    # ---------------------------------------------------
-    def to_json_lines(x):
-        key, nbrs = x
-        return json.dumps({"key": list(key), "value": nbrs})
+                    # Right neighbor => footprint i+1, same h
+                    if i + 1 < num_footprints:
+                        lat_right = footprint_attrs_np[i + 1, idx_lat]
+                        lon_right = footprint_attrs_np[i + 1, idx_lon]
+                        tai_right = footprint_attrs_np[i + 1, idx_tai_start]
+                        prof_right = footprint_attrs_np[i + 1, idx_profile_time]
+                        t_right = float(tai_right + prof_right)
+                        nb_pixel = input_features_np[i + 1, h, :]
+                        if isEvent(nb_pixel) and abs(t_right - t_current) <= 500.0:
+                            neighbors.append((base_name, t_right, float(lat_right), float(lon_right), h))
 
-    adjacency_rdd.map(to_json_lines).saveAsTextFile(args.output_dir)
+                    # Emit a single record for each event pixel:
+                    # Key:   (base_name, t, lat, lon, h)
+                    # Value: list of neighbor coords
+                    results.append((key, neighbors))
+
+    return results
+
+def main(hdf5_chunks_dir, output_path):
+    """
+    PySpark job that:
+      1) Lists .h5 chunk files in `hdf5_chunks_dir`.
+      2) Parallelizes those chunk paths.
+      3) For each chunk, creates adjacency for event pixels keyed by (fileName, t, lat, lon, h).
+      4) Writes adjacency as text lines: 
+         "(((fileName, t, lat, lon, h), [ (fileName, t2, lat2, lon2, h2), ... ]))"
+      5) Removes output_path if it exists.
+    """
+    spark = SparkSession.builder.appName("BuildEventAdjacency").getOrCreate()
+    sc = spark.sparkContext
+
+    # Remove output directory if it exists
+    if os.path.exists(output_path):
+        print(f"[INFO] Removing existing directory: {output_path}")
+        shutil.rmtree(output_path)
+
+    # List chunked .h5 files
+    chunk_files = [
+        os.path.join(hdf5_chunks_dir, fname)
+        for fname in os.listdir(hdf5_chunks_dir)
+        if fname.endswith(".h5")
+    ]
+    if not chunk_files:
+        print(f"No .h5 files found in {hdf5_chunks_dir}", file=sys.stderr)
+        spark.stop()
+        sys.exit(1)
+
+    # Parallelize file list
+    files_rdd = sc.parallelize(chunk_files)
+
+    # Build adjacency for each chunk => RDD of ((fileName, t, x, y, h), neighbors_list)
+    adjacency_rdd = files_rdd.flatMap(build_event_adjacency)
+
+    # Save as text
+    adjacency_rdd.saveAsTextFile(output_path)
 
     spark.stop()
-    print("Adjacency build complete. Written to:", args.output_dir)
 
 if __name__ == "__main__":
-    main()
+    """
+    Usage:
+      spark-submit build_xyth_adjacency.py <chunks_dir> <output_dir>
+
+    Example:
+      spark-submit build_xyth_adjacency.py \
+          ./chunks4spark \
+          ./event_adjacency_out
+    """
+    if len(sys.argv) < 3:
+        print("Usage: spark-submit build_xyth_adjacency.py <chunks_dir> <output_dir>", file=sys.stderr)
+        sys.exit(1)
+
+    chunks_dir = sys.argv[1]
+    out_dir = sys.argv[2]
+    main(chunks_dir, out_dir)
